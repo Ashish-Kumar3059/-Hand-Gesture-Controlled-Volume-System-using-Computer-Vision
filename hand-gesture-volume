@@ -1,0 +1,177 @@
+"""
+hand_volume_controller.py
+Controls Windows system volume using thumb-index finger distance from webcam.
+
+Dependencies:
+- opencv-python
+- mediapipe
+- numpy
+- pycaw
+- comtypes
+"""
+
+import cv2
+import mediapipe as mp
+import time
+import math
+import numpy as np
+from collections import deque
+
+# --- Windows audio control (pycaw) ---
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+    devices = AudioUtilities.GetSpeakers()
+    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    volume_controller = cast(interface, POINTER(IAudioEndpointVolume))
+    # get volume range (min, max, step)
+    vol_range = volume_controller.GetVolumeRange()
+    VOL_MIN_DB = vol_range[0]
+    VOL_MAX_DB = vol_range[1]
+    USE_PYCAW = True
+except Exception as e:
+    print("pycaw import failed or not on Windows. Volume changes will not apply to system.")
+    print("Exception:", e)
+    volume_controller = None
+    USE_PYCAW = False
+
+# --- Mediapipe / OpenCV init ---
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6,
+)
+
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # use cv2.CAP_DSHOW on Windows to avoid warnings
+time.sleep(1.0)
+
+# default mapping distances (pixels) - can calibrate
+MIN_DIST = 20    # pinch close
+MAX_DIST = 220   # fingers far apart
+
+# smoothing
+smooth_factor = 0.7   # 0..1 (higher -> smoother but slower)
+prev_vol = 0.0
+
+# moving average for smoother UI value
+vol_history = deque(maxlen=5)
+
+# calibration state
+calibrating = False
+
+# FPS calc
+p_time = 0
+
+def set_system_volume_scalar(scalar):
+    """scalar in [0.0, 1.0]"""
+    scalar = max(0.0, min(1.0, float(scalar)))
+    if USE_PYCAW:
+        try:
+            # prefer scalar API (0.0 - 1.0)
+            volume_controller.SetMasterVolumeLevelScalar(scalar, None)
+        except Exception:
+            # fallback: set by dB interpolation
+            db = VOL_MIN_DB + (VOL_MAX_DB - VOL_MIN_DB) * scalar
+            volume_controller.SetMasterVolumeLevel(db, None)
+    else:
+        # fallback: just print (non-Windows or pycaw not installed)
+        print(f"[DEBUG] Volume scalar would be set to: {scalar:.2f}")
+
+def get_volume_percent():
+    if USE_PYCAW:
+        try:
+            return int(volume_controller.GetMasterVolumeLevelScalar() * 100)
+        except Exception:
+            return None
+    return None
+
+print("Press 'q' to quit, 'c' to toggle calibration mode, 'p' to save MIN (pinch), 'o' to save MAX (open).")
+
+while True:
+    success, frame = cap.read()
+    if not success:
+        print("Cannot read from webcam. Exiting.")
+        break
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
+
+    length = None
+    if results.multi_hand_landmarks:
+        for handLms in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
+            lm_list = []
+            for id, lm in enumerate(handLms.landmark):
+                lm_list.append((int(lm.x * w), int(lm.y * h)))
+            # tip ids: thumb=4, index=8
+            x1, y1 = lm_list[4]
+            x2, y2 = lm_list[8]
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+            cv2.circle(frame, (x1, y1), 8, (255, 0, 255), cv2.FILLED)
+            cv2.circle(frame, (x2, y2), 8, (255, 0, 255), cv2.FILLED)
+            cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            cv2.circle(frame, (cx, cy), 6, (0, 255, 0), cv2.FILLED)
+
+            length = math.hypot(x2 - x1, y2 - y1)  # pixel distance
+
+            # Map length -> 0.0..1.0
+            vol_scalar = np.interp(length, [MIN_DIST, MAX_DIST], [0.0, 1.0])
+            # smoothing with previous value
+            smoothed = prev_vol * smooth_factor + vol_scalar * (1 - smooth_factor)
+            prev_vol = smoothed
+
+            vol_history.append(smoothed)
+            avg_vol = sum(vol_history) / len(vol_history)
+
+            set_system_volume_scalar(avg_vol)
+
+            # Visual volume bar
+            vol_bar_y = int(np.interp(avg_vol, [0, 1], [400, 150]))
+            vol_pct = int(avg_vol * 100)
+
+            cv2.rectangle(frame, (50, 150), (85, 400), (0, 255, 0), 2)
+            cv2.rectangle(frame, (50, vol_bar_y), (85, 400), (0, 255, 0), cv2.FILLED)
+            cv2.putText(frame, f'{vol_pct} %', (30, 430), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            cv2.putText(frame, f'Dist: {int(length)} px', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+            # Mark calibration hints
+            if calibrating:
+                cv2.putText(frame, "CALIBRATION MODE: Press 'p' to set MIN (pinch), 'o' to set MAX (open)", (10, 460),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+    else:
+        # no hand detected
+        cv2.putText(frame, "No hand detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    # FPS
+    c_time = time.time()
+    fps = 1 / (c_time - p_time) if c_time != p_time else 0
+    p_time = c_time
+    cv2.putText(frame, f'FPS: {int(fps)}', (w - 110, 30), cv2.FONT_HERSHEY_COMPLEX, 0.7, (0, 255, 0), 2)
+
+    cv2.imshow("Hand Volume Controller", frame)
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('q'):
+        break
+    elif key == ord('c'):
+        calibrating = not calibrating
+        print("Calibration mode:", calibrating)
+    elif key == ord('p') and calibrating and length is not None:
+        MIN_DIST = max(5, int(length))
+        print(f"Saved MIN_DIST = {MIN_DIST} pixels")
+    elif key == ord('o') and calibrating and length is not None:
+        MAX_DIST = max(MIN_DIST + 10, int(length))
+        print(f"Saved MAX_DIST = {MAX_DIST} pixels")
+
+cap.release()
+cv2.destroyAllWindows()
